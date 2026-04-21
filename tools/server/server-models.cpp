@@ -818,6 +818,7 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             proxy_path,
             req.headers,
             req.body,
+            req.files,
             req.should_stop,
             base_params.timeout_read,
             base_params.timeout_write
@@ -1121,6 +1122,53 @@ static bool should_strip_proxy_header(const std::string & header_name) {
     return false;
 }
 
+static httplib::UploadFormDataItems build_multipart_items(
+        const std::string & body,
+        const std::map<std::string, raw_buffer> & files) {
+    httplib::UploadFormDataItems items;
+
+    if (!body.empty()) {
+        auto body_json = json::parse(body);
+        if (!body_json.is_object()) {
+            throw std::runtime_error("expected multipart form body to be a JSON object");
+        }
+
+        for (const auto & [key, value] : body_json.items()) {
+            auto add_item = [&items, &key](const json & item_value) {
+                httplib::UploadFormData item;
+                item.name = key;
+                item.filename.clear();
+                item.content_type.clear();
+                if (item_value.is_string()) {
+                    item.content = item_value.get<std::string>();
+                } else {
+                    item.content = item_value.dump();
+                }
+                items.push_back(std::move(item));
+            };
+
+            if (value.is_array()) {
+                for (const auto & item_value : value) {
+                    add_item(item_value);
+                }
+            } else {
+                add_item(value);
+            }
+        }
+    }
+
+    for (const auto & [key, value] : files) {
+        httplib::UploadFormData item;
+        item.name = key;
+        item.filename = key;
+        item.content_type = "application/octet-stream";
+        item.content.assign(value.begin(), value.end());
+        items.push_back(std::move(item));
+    }
+
+    return items;
+}
+
 server_http_proxy::server_http_proxy(
         const std::string & method,
         const std::string & scheme,
@@ -1129,6 +1177,7 @@ server_http_proxy::server_http_proxy(
         const std::string & path,
         const std::map<std::string, std::string> & headers,
         const std::string & body,
+        const std::map<std::string, raw_buffer> & files,
         const std::function<bool()> should_stop,
         int32_t timeout_read,
         int32_t timeout_write
@@ -1190,41 +1239,70 @@ server_http_proxy::server_http_proxy(
         return pipe->write({{}, 0, std::string(data, data_length), ""});
     };
 
-    // prepare the request to destination server
-    httplib::Request req;
-    {
-        req.method = method;
-        req.path = path;
-        for (const auto & [key, value] : headers) {
-            if (key == "Accept-Encoding") {
-                // disable Accept-Encoding to avoid compressed responses
-                continue;
-            }
-            if (key == "Transfer-Encoding") {
-                // the body is already decoded
-                continue;
-            }
-            if (key == "Host" || key == "host") {
-                bool is_default_port = (scheme == "https" && port == 443) || (scheme == "http" && port == 80);
-                req.set_header(key, is_default_port ? host : host + ":" + std::to_string(port));
-            } else {
-                req.set_header(key, value);
-            }
+    httplib::Headers forwarded_headers;
+    for (const auto & [key, value] : headers) {
+        if (key == "Accept-Encoding") {
+            continue;
         }
-        req.body = body;
-        req.response_handler = response_handler;
-        req.content_receiver = content_receiver;
+        if (key == "Transfer-Encoding") {
+            continue;
+        }
+        if (!files.empty() && (key == "Content-Type" || key == "content-type" || key == "Content-Length" || key == "content-length")) {
+            continue;
+        }
+        if (key == "Host" || key == "host") {
+            bool is_default_port = (scheme == "https" && port == 443) || (scheme == "http" && port == 80);
+            forwarded_headers.emplace(key, is_default_port ? host : host + ":" + std::to_string(port));
+        } else {
+            forwarded_headers.emplace(key, value);
+        }
     }
 
     // start the proxy thread
-    SRV_DBG("start proxy thread %s %s\n", req.method.c_str(), req.path.c_str());
-    this->thread = std::thread([cli, pipe, req]() {
-        auto result = cli->send(std::move(req));
+    SRV_DBG("start proxy thread %s %s\n", method.c_str(), path.c_str());
+    this->thread = std::thread([cli, pipe, method, path, forwarded_headers, body, files, response_handler, content_receiver]() mutable {
+        httplib::Result result;
+
+        if (!files.empty()) {
+            if (method != "POST") {
+                throw std::runtime_error("multipart proxy currently only supports POST requests");
+            }
+            auto items = build_multipart_items(body, files);
+            result = cli->Post(path, forwarded_headers, items);
+        } else {
+            httplib::Request req;
+            req.method = method;
+            req.path = path;
+            req.headers = forwarded_headers;
+            req.body = body;
+            req.response_handler = response_handler;
+            req.content_receiver = content_receiver;
+            result = cli->send(std::move(req));
+        }
+
         if (result.error() != httplib::Error::Success) {
             auto err_str = httplib::to_string(result.error());
             SRV_ERR("http client error: %s\n", err_str.c_str());
             pipe->write({{}, 500, "", ""}); // header
             pipe->write({{}, 0, "proxy error: " + err_str, ""}); // body
+        } else if (!files.empty() && result) {
+            msg_t msg;
+            msg.status = result->status;
+            for (const auto & [key, value] : result->headers) {
+                const auto lowered = to_lower_copy(key);
+                if (should_strip_proxy_header(lowered)) {
+                    continue;
+                }
+                if (lowered == "content-type") {
+                    msg.content_type = value;
+                    continue;
+                }
+                msg.headers[key] = value;
+            }
+            pipe->write(std::move(msg));
+            if (!result->body.empty()) {
+                pipe->write({{}, 0, result->body, ""});
+            }
         }
         pipe->close_write(); // signal EOF to reader
         SRV_DBG("%s", "client request thread ended\n");
