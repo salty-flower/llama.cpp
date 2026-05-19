@@ -1,10 +1,19 @@
 #include "../op_table.h"
 #include "../utils.h"
 #include <openvino/op/reshape.hpp>
+
 namespace ov {
 namespace frontend {
 namespace ggml {
 namespace op {
+
+static size_t shape_size(const ov::Shape & shape) {
+    size_t size = 1;
+    for (const auto dim : shape) {
+        size *= dim;
+    }
+    return size;
+}
 
 OutputVector translate_view(const NodeContext & context) {
     num_inputs_check(context, 1, 1);
@@ -44,7 +53,17 @@ OutputVector translate_view(const NodeContext & context) {
         auto sliced = std::make_shared<ov::op::v8::Slice>(input, begin, end, stride, axes);
         return {sliced};
     }
-    return {context.get_input(0)};
+
+    auto input = context.get_input(0);
+    auto src_shape = context.get_input_shape(0).to_shape();
+    auto dst_shape = context.get_output_shape().to_shape();
+    if (src_shape != dst_shape && shape_size(src_shape) == shape_size(dst_shape)) {
+        auto new_shape = ov::op::v0::Constant::create(ov::element::i64, {dst_shape.size()}, dst_shape);
+        return rename_outputs_with_suffix({std::make_shared<ov::op::v1::Reshape>(input, new_shape, false)},
+                                          context.get_name());
+    }
+
+    return {input};
 }
 
 }  // namespace op

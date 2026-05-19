@@ -57,6 +57,56 @@ OutputVector translate_permute(const NodeContext & context) {
         int64_t ctx_per_seq = cache_shape[2].is_static() ? cache_shape[2].get_length() : -1;
         int64_t n_seq = cache_shape[1].get_length();
 
+        if (cache_shape[2].is_static() && cache_shape[3].is_static() && cache_shape[3].get_length() == 1 &&
+            n_heads > 0 && output_shape[2] > 0 &&
+            cache_shape[2].get_length() % (n_heads * static_cast<int64_t>(output_shape[2])) == 0) {
+            const int64_t v_head_size = output_shape[2];
+            const int64_t v_attention_size = output_shape[3];
+            const int64_t v_ctx_per_seq = cache_shape[2].get_length() / (n_heads * v_head_size);
+            if (v_attention_size <= v_ctx_per_seq) {
+                Output<Node> attention_size;
+                if (!context.has_input("attention_size")) {
+                    attention_size = ov::op::v0::Constant::create(ov::element::i64, {1}, {v_attention_size});
+                } else if (op_case == 2) {
+                    attention_size = context.get_input("attention_size");
+                } else {
+                    attention_size = context.get_input("attention_size_swa");
+                }
+
+                Output<Node> seq_active_start;
+                Output<Node> seq_active_end;
+                if (context.has_input("seq_active_start")) {
+                    seq_active_start = context.get_input("seq_active_start");
+                    seq_active_end = context.get_input("seq_active_end");
+                } else {
+                    int64_t n_seq_active = output_shape[0];
+                    size_t offset = *((size_t *) context.get_input_op_params(0));
+                    int64_t seq_active_start_val = offset / context.get_input_stride(0)[0];
+                    seq_active_start = ov::op::v0::Constant::create(ov::element::i64, {1}, {seq_active_start_val});
+                    seq_active_end = ov::op::v0::Constant::create(ov::element::i64, {1}, {seq_active_start_val + n_seq_active});
+                }
+
+                auto zero = ov::op::v0::Constant::create(ov::element::i64, {1}, {0});
+                auto one = ov::op::v0::Constant::create(ov::element::i64, {1}, {1});
+                auto three = ov::op::v0::Constant::create(ov::element::i64, {1}, {3});
+                auto src_reshaped = std::make_shared<ov::op::v1::Reshape>(
+                    src,
+                    ov::op::v0::Constant::create(
+                        ov::element::i64, {4}, {n_seq, n_heads, v_head_size, v_ctx_per_seq}),
+                    false);
+                auto slice1 = std::make_shared<ov::op::v8::Slice>(src_reshaped, seq_active_start, seq_active_end, one, zero);
+                auto slice2 = std::make_shared<ov::op::v8::Slice>(slice1, zero, attention_size, one, three);
+                auto transposed = std::make_shared<ov::op::v1::Transpose>(
+                    slice2, ov::op::v0::Constant::create(ov::element::i64, {4}, {0, 1, 3, 2}));
+                return rename_outputs_with_suffix({transposed}, context.get_name());
+            }
+        }
+
+        if (cache_shape[2].is_static() && cache_shape[3].is_static() && cache_shape[3].get_length() == 1 &&
+            n_heads > 0 && head_size > 0 && cache_shape[2].get_length() % (n_heads * head_size) == 0) {
+            ctx_per_seq = cache_shape[2].get_length() / (n_heads * head_size);
+        }
+
         Output<Node> attention_size;
         if (!context.has_input("attention_size")) {
             attention_size = ov::op::v0::Constant::create(ov::element::i64, {1}, {output_shape[2]});

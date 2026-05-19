@@ -50,7 +50,9 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
     m_is_stateful(is_stateful),
     m_is_prefill(is_prefill),
     m_naive(false),
-    m_prefill_chunk_size(prefill_chunk_size),
+    m_prefill_chunk_size(is_static && is_prefill && getenv("GGML_OPENVINO_PREFILL_EXACT_INPUT") != nullptr ?
+                             compute_params.input_len :
+                             prefill_chunk_size),
     m_cgraph(cgraph),
     m_model_weights(model_weights),
     m_model_params(model_params),
@@ -324,6 +326,10 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
         }
         if (node->op == GGML_OP_ROPE) {
             memcpy(model_params.rope_params, node->op_params, sizeof(int32_t) * 15);
+            if (compute_params.input_len == -1 && node->src[1] != nullptr) {
+                compute_params.input_len = node->src[1]->ne[0];
+                compute_params.token_len_per_seq = node->src[1]->ne[0];
+            }
         }
     }
     auto * output_tensor = cgraph->nodes[cgraph->n_nodes - 1];
@@ -332,6 +338,8 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
     if (is_static && compute_params.output_len == 0) {
         compute_params.output_len = 1;
     }
+    model_params.input_len = compute_params.input_len;
+    model_params.output_len = compute_params.output_len;
     model_params.ctx = model_params.ctx_per_seq * model_params.n_seq;
     model_params.ctx_swa = model_params.ctx_per_seq_swa * model_params.n_seq;
     return {model_params, compute_params};
@@ -389,10 +397,13 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, co
     } else if (is_kv_idx(input, op)) {
         // kv update index
         int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1;
+        if (m_is_static && m_compute_params.input_len > 0 && input->ne[0] % m_compute_params.input_len == 0) {
+            len *= input->ne[0] / m_compute_params.input_len;
+        }
         input_shape = ov::PartialShape{1, 1, 1, len};
 
     } else {
-        input_shape = ov::PartialShape{get_shape(input)};
+        input_shape = ov::PartialShape{get_static_shape(input)};
     }
     return input_shape;
 }
@@ -821,6 +832,19 @@ ov::Shape GgmlOvDecoder::get_shape(const ggml_tensor * tensor) {
     return shape;
 }
 
+ov::Shape GgmlOvDecoder::get_static_shape(const ggml_tensor * tensor) const {
+    auto shape = get_shape(tensor);
+    if (!(m_is_static && m_is_prefill) || m_compute_params.input_len <= 0) {
+        return shape;
+    }
+    for (auto & dim : shape) {
+        if (dim == static_cast<size_t>(m_compute_params.input_len)) {
+            dim = static_cast<size_t>(m_prefill_chunk_size);
+        }
+    }
+    return shape;
+}
+
 std::vector<size_t> GgmlOvDecoder::get_stride(const ggml_tensor * tensor) {
     std::vector<size_t> stride;
     for (int i = GGML_MAX_DIMS - 1; i >= 0; --i) {
@@ -853,7 +877,7 @@ ov::element::Type GgmlOvDecoder::get_ov_type(const ggml_tensor * tensor) {
 }
 
 ov::PartialShape GgmlOvDecoder::get_input_shape(int node_idx, const std::string & name) const {
-    return ov::PartialShape(get_shape(m_node_info_list[node_idx].node_inputs.at(name)));
+    return ov::PartialShape(get_static_shape(m_node_info_list[node_idx].node_inputs.at(name)));
 }
 
 std::vector<size_t> GgmlOvDecoder::get_input_stride(int node_idx, const std::string & name) const {
@@ -878,7 +902,7 @@ std::vector<std::string> GgmlOvDecoder::get_input_names(int node_idx) const {
 
 ov::PartialShape GgmlOvDecoder::get_output_shape(int node_idx) const {
     auto * ggml_tensor = m_node_info_list[node_idx].node_output;
-    return ov::PartialShape(get_shape(ggml_tensor));
+    return ov::PartialShape(get_static_shape(ggml_tensor));
 }
 
 ov::element::Type GgmlOvDecoder::get_output_type(const int node_idx) const {

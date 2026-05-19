@@ -21,6 +21,8 @@ struct ModelParams {
     int n_heads = -1;
     int n_heads_kv = -1;
     int head_size = -1;
+    int input_len = -1;
+    int output_len = -1;
     int32_t rope_params[15];
     std::vector<int> swa_layers;
 
@@ -33,7 +35,9 @@ struct ModelParams {
 
     bool can_reuse_dynamically(const ModelParams & other) const { return same_rope_params(other); }
 
-    bool can_reuse_statically(const ModelParams & other) const { return same_rope_params(other) && ctx == other.ctx; }
+    bool can_reuse_statically(const ModelParams & other) const {
+        return same_rope_params(other) && ctx == other.ctx && input_len == other.input_len && output_len == other.output_len;
+    }
 
     bool kv_buffer_changed(const ModelParams & other) const { return kv_buffer_ctx_id != other.kv_buffer_ctx_id; }
 };
@@ -205,6 +209,8 @@ public:
     bool m_is_prefill = false;
     bool m_naive = false;
     int m_prefill_chunk_size = 0;
+
+    ov::Shape get_static_shape(const ggml_tensor * tensor) const;
 
     static ov::Shape get_shape(const ggml_tensor * tensor);
     static std::vector<size_t> get_stride(const ggml_tensor * tensor);

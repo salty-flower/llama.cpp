@@ -8,7 +8,9 @@
 #include "openvino/input_model.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <openvino/core/any.hpp>
 #include <openvino/core/graph_util.hpp>
@@ -28,6 +31,7 @@
 #include <openvino/runtime/intel_npu/properties.hpp>
 #include <openvino/runtime/properties.hpp>
 #include <openvino/runtime/tensor.hpp>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -36,15 +40,106 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
+static bool is_empty_graph_without_side_effects(const ggml_cgraph * cgraph) {
+    if (cgraph->n_nodes == 0) {
+        return true;
+    }
+
+    const ggml_tensor * output = cgraph->nodes[cgraph->n_nodes - 1];
+    if (ggml_nelements(output) != 0) {
+        return false;
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op == GGML_OP_SET_ROWS) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static std::string ov_shape_to_string(const ov::Shape & shape) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << shape[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+static size_t ov_shape_size(const ov::Shape & shape) {
+    size_t size = 1;
+    for (const auto dim : shape) {
+        size *= dim;
+    }
+    return size;
+}
+
+static bool is_view_like_output(const ggml_tensor * tensor) {
+    return tensor->op == GGML_OP_VIEW ||
+           tensor->op == GGML_OP_RESHAPE ||
+           tensor->op == GGML_OP_PERMUTE ||
+           tensor->op == GGML_OP_TRANSPOSE;
+}
+
+static std::vector<size_t> ov_row_major_strides(const ov::Shape & shape) {
+    std::vector<size_t> strides(shape.size(), 1);
+    for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    return strides;
+}
+
+static std::string sanitize_filename_part(const char * name) {
+    std::string sanitized = name && name[0] != '\0' ? name : "unnamed";
+    for (auto & ch : sanitized) {
+        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '-' && ch != '_') {
+            ch = '_';
+        }
+    }
+    if (sanitized.size() > 48) {
+        sanitized.resize(48);
+    }
+    return sanitized;
+}
+
+static void maybe_dump_cgraph(const ggml_cgraph * cgraph) {
+    const char * dump_dir = getenv("GGML_OPENVINO_DUMP_CGRAPH_DIR");
+    if (dump_dir && dump_dir[0] != '\0') {
+        static std::atomic<unsigned long long> dump_counter{0};
+        const auto index = dump_counter.fetch_add(1);
+        const auto first = cgraph->n_nodes > 0 ? sanitize_filename_part(cgraph->nodes[0]->name) : "empty";
+        const auto last = cgraph->n_nodes > 0 ? sanitize_filename_part(cgraph->nodes[cgraph->n_nodes - 1]->name) : "empty";
+        char filename[1024];
+        snprintf(filename, sizeof(filename), "%s/cgraph_%06llu_n%d_%s__%s.txt",
+                 dump_dir, index, cgraph->n_nodes, first.c_str(), last.c_str());
+        std::string filename_string(filename);
+        GgmlOvDecoder::dump_cgraph(cgraph, filename_string);
+        return;
+    }
+
+    if (getenv("GGML_OPENVINO_DUMP_CGRAPH")) {
+        std::string filename = "cgraph_ov.txt";
+        GgmlOvDecoder::dump_cgraph(cgraph, filename);
+    }
+}
+
 enum ggml_status ov_graph_compute(ggml_cgraph * cgraph, ggml_backend_t backend) {
     ggml_backend_openvino_context * ctx = (ggml_backend_openvino_context *) backend->context;
     try {
-        if (getenv("GGML_OPENVINO_DUMP_CGRAPH")) {
-            std::string filename = "cgraph_ov.txt";
-            GgmlOvDecoder::dump_cgraph(cgraph, filename);
+        maybe_dump_cgraph(cgraph);
+
+        if (is_empty_graph_without_side_effects(cgraph)) {
+            GGML_LOG_DEBUG("OpenVINO backend skipped empty graph without side effects\n");
+            return GGML_STATUS_SUCCESS;
         }
 
-        const auto is_static = ggml_openvino_is_npu();
+        const auto is_static = ggml_openvino_is_npu() && getenv("GGML_OPENVINO_FORCE_DYNAMIC") == nullptr;
 
         GGML_ASSERT(ctx->runtime_context != nullptr);
         std::shared_ptr<ov_runtime_context> r_ctx = std::static_pointer_cast<ov_runtime_context>(ctx->runtime_context);
@@ -76,6 +171,254 @@ ov::Tensor create_ov_output_tensor(std::shared_ptr<GgmlOvDecoder> ggml_decoder,
 
     ov::Tensor output_tensor(output_type, output_shape, ggml_tensor->data);
     return output_tensor;
+}
+
+static void copy_ov_output_to_ggml_strided(const ov::Tensor & output_tensor,
+                                           const ggml_tensor * ggml_tensor,
+                                           const ov::Shape & copy_shape,
+                                           bool linear_source,
+                                           size_t dst_axis = GGML_MAX_DIMS,
+                                           size_t dst_axis_offset = 0) {
+    const auto src_shape = output_tensor.get_shape();
+    const auto dst_shape = GgmlOvDecoder::get_shape(ggml_tensor);
+    const size_t rank = copy_shape.size();
+    GGML_ASSERT(rank > 0 && rank <= GGML_MAX_DIMS);
+
+    const size_t element_size = output_tensor.get_byte_size() / output_tensor.get_size();
+    const auto src_strides = ov_row_major_strides(src_shape);
+    const auto * src = static_cast<const uint8_t *>(output_tensor.data());
+    auto * dst = static_cast<uint8_t *>(ggml_tensor->data);
+
+    size_t outer_size = 1;
+    for (size_t i = 0; i + 1 < rank; ++i) {
+        outer_size *= copy_shape[i];
+    }
+    const size_t inner_size = copy_shape[rank - 1];
+
+    std::vector<size_t> idx(rank, 0);
+    size_t linear_source_offset = 0;
+    for (size_t outer = 0; outer < outer_size; ++outer) {
+        size_t src_offset_elements = linear_source ? linear_source_offset : 0;
+        size_t dst_offset_bytes = 0;
+        for (size_t i = 0; i + 1 < rank; ++i) {
+            if (!linear_source) {
+                src_offset_elements += idx[i] * src_strides[i];
+            }
+            const size_t dst_idx = idx[i] + (i == dst_axis ? dst_axis_offset : 0);
+            dst_offset_bytes += dst_idx * ggml_tensor->nb[rank - 1 - i];
+        }
+
+        std::memcpy(dst + dst_offset_bytes, src + src_offset_elements * element_size, inner_size * element_size);
+        linear_source_offset += inner_size;
+
+        for (int i = static_cast<int>(rank) - 2; i >= 0; --i) {
+            idx[i]++;
+            if (idx[i] < copy_shape[i]) {
+                break;
+            }
+            idx[i] = 0;
+        }
+    }
+}
+
+static bool is_last_two_axes_swapped(const ov::Shape & src_shape, const ov::Shape & dst_shape) {
+    if (src_shape.size() != dst_shape.size() || src_shape.size() < 2) {
+        return false;
+    }
+
+    const size_t rank = src_shape.size();
+    for (size_t i = 0; i + 2 < rank; ++i) {
+        if (src_shape[i] != dst_shape[i]) {
+            return false;
+        }
+    }
+
+    return src_shape[rank - 2] == dst_shape[rank - 1] &&
+           src_shape[rank - 1] == dst_shape[rank - 2];
+}
+
+static void copy_ov_output_to_ggml_last_two_axes_swapped(const ov::Tensor & output_tensor,
+                                                         const ggml_tensor * ggml_tensor,
+                                                         size_t src_axis_a_len = SIZE_MAX,
+                                                         size_t dst_axis_a_offset = 0) {
+    const auto src_shape = output_tensor.get_shape();
+    const auto dst_shape = GgmlOvDecoder::get_shape(ggml_tensor);
+    const size_t rank = src_shape.size();
+    GGML_ASSERT(rank > 1 && rank <= GGML_MAX_DIMS);
+    if (src_axis_a_len == SIZE_MAX) {
+        src_axis_a_len = src_shape[rank - 2];
+    }
+    GGML_ASSERT(src_axis_a_len <= src_shape[rank - 2]);
+    GGML_ASSERT(dst_axis_a_offset + src_axis_a_len <= dst_shape[rank - 1]);
+
+    const size_t element_size = output_tensor.get_byte_size() / output_tensor.get_size();
+    const auto src_strides = ov_row_major_strides(src_shape);
+    const auto * src = static_cast<const uint8_t *>(output_tensor.data());
+    auto * dst = static_cast<uint8_t *>(ggml_tensor->data);
+
+    size_t outer_size = 1;
+    for (size_t i = 0; i + 2 < rank; ++i) {
+        outer_size *= src_shape[i];
+    }
+
+    std::vector<size_t> idx(rank, 0);
+    const size_t src_axis_a = rank - 2;
+    const size_t src_axis_b = rank - 1;
+    const size_t dst_axis_a_nb = rank - 1 - src_axis_b;
+    const size_t dst_axis_b_nb = rank - 1 - src_axis_a;
+    for (size_t outer = 0; outer < outer_size; ++outer) {
+        size_t src_outer_offset_elements = 0;
+        size_t dst_outer_offset_bytes = 0;
+        for (size_t i = 0; i + 2 < rank; ++i) {
+            src_outer_offset_elements += idx[i] * src_strides[i];
+            dst_outer_offset_bytes += idx[i] * ggml_tensor->nb[rank - 1 - i];
+        }
+
+        for (size_t a = 0; a < src_axis_a_len; ++a) {
+            const size_t src_offset_elements = src_outer_offset_elements + a * src_strides[src_axis_a];
+            const size_t dst_offset_bytes =
+                dst_outer_offset_bytes + (dst_axis_a_offset + a) * ggml_tensor->nb[dst_axis_a_nb];
+            for (size_t b = 0; b < src_shape[src_axis_b]; ++b) {
+                std::memcpy(dst + dst_offset_bytes + b * ggml_tensor->nb[dst_axis_b_nb],
+                            src + (src_offset_elements + b) * element_size,
+                            element_size);
+            }
+        }
+
+        for (int i = static_cast<int>(rank) - 3; i >= 0; --i) {
+            idx[i]++;
+            if (idx[i] < src_shape[i]) {
+                break;
+            }
+            idx[i] = 0;
+        }
+    }
+}
+
+static void copy_ov_output_to_ggml(const ov::Tensor & output_tensor, const ggml_tensor * ggml_tensor) {
+    const auto src_shape = output_tensor.get_shape();
+    const auto dst_shape = GgmlOvDecoder::get_shape(ggml_tensor);
+
+    if (src_shape == dst_shape) {
+        copy_ov_output_to_ggml_strided(output_tensor, ggml_tensor, dst_shape, false);
+        return;
+    }
+
+    if (is_last_two_axes_swapped(src_shape, dst_shape)) {
+        copy_ov_output_to_ggml_last_two_axes_swapped(output_tensor, ggml_tensor);
+        return;
+    }
+
+    if (output_tensor.get_size() == static_cast<size_t>(ggml_nelements(ggml_tensor))) {
+        copy_ov_output_to_ggml_strided(output_tensor, ggml_tensor, dst_shape, true);
+        return;
+    }
+
+    throw std::runtime_error("Unexpected output shape for " + std::string(ggml_tensor->name) +
+                             ": src=" + ov_shape_to_string(src_shape) +
+                             ", dst=" + ov_shape_to_string(dst_shape));
+}
+
+static bool can_bind_ov_output_directly(const ov::Shape & output_shape, const ggml_tensor * ggml_tensor) {
+    return output_shape == GgmlOvDecoder::get_shape(ggml_tensor) &&
+           ggml_is_contiguous(ggml_tensor) &&
+           !is_view_like_output(ggml_tensor);
+}
+
+static bool is_static_cache_view_output(const ggml_tensor * tensor) {
+    const std::string name(tensor->name);
+    return name.rfind("cache_k_", 0) == 0 ||
+           name.rfind("cache_v_", 0) == 0;
+}
+
+static void copy_static_prefill_output_to_ggml(const ov::Tensor & output_tensor,
+                                               const ggml_tensor * ggml_tensor,
+                                               size_t input_len,
+                                               size_t chunk_size,
+                                               int chunk_index) {
+    const auto src_shape = output_tensor.get_shape();
+    const auto dst_shape = GgmlOvDecoder::get_shape(ggml_tensor);
+    if (src_shape.size() != dst_shape.size()) {
+        throw std::runtime_error("Unexpected padded output rank for " + std::string(ggml_tensor->name));
+    }
+
+    if (output_tensor.get_size() == static_cast<size_t>(ggml_nelements(ggml_tensor))) {
+        copy_ov_output_to_ggml(output_tensor, ggml_tensor);
+        return;
+    }
+
+    const size_t valid_len = std::min(chunk_size, input_len - chunk_index * chunk_size);
+    if (src_shape.size() == dst_shape.size() && src_shape.size() >= 2) {
+        const size_t rank = src_shape.size();
+        bool outer_dims_match = true;
+        for (size_t i = 0; i + 2 < rank; ++i) {
+            if (src_shape[i] != dst_shape[i]) {
+                outer_dims_match = false;
+                break;
+            }
+        }
+        if (outer_dims_match &&
+            src_shape[rank - 2] == chunk_size &&
+            src_shape[rank - 1] == dst_shape[rank - 2] &&
+            chunk_index * chunk_size + valid_len <= dst_shape[rank - 1]) {
+            copy_ov_output_to_ggml_last_two_axes_swapped(
+                output_tensor, ggml_tensor, valid_len, chunk_index * chunk_size);
+            return;
+        }
+    }
+
+    size_t axis = src_shape.size();
+    size_t src_axis_len = 0;
+    size_t dst_axis_len = 0;
+    size_t dst_axis_offset = 0;
+    for (size_t i = 0; i < src_shape.size(); ++i) {
+        if (src_shape[i] == chunk_size && dst_shape[i] == valid_len) {
+            axis = i;
+            src_axis_len = chunk_size;
+            dst_axis_len = valid_len;
+            break;
+        }
+        if (src_shape[i] == chunk_size && dst_shape[i] == input_len) {
+            axis = i;
+            src_axis_len = chunk_size;
+            dst_axis_len = valid_len;
+            dst_axis_offset = chunk_index * chunk_size;
+            break;
+        }
+    }
+    if (axis == src_shape.size()) {
+        for (size_t i = 0; i < src_shape.size(); ++i) {
+            if (src_shape[i] > dst_shape[i]) {
+                axis = i;
+                src_axis_len = src_shape[i];
+                dst_axis_len = dst_shape[i];
+                break;
+            }
+        }
+    }
+    if (axis == src_shape.size()) {
+        throw std::runtime_error("Unexpected padded output shape for " + std::string(ggml_tensor->name) +
+                                 ": src=" + ov_shape_to_string(src_shape) +
+                                 ", dst=" + ov_shape_to_string(dst_shape) +
+                                 ", valid_len=" + std::to_string(valid_len) +
+                                 ", chunk_size=" + std::to_string(chunk_size));
+    }
+
+    ov::Shape copy_shape = dst_shape;
+    for (size_t i = 0; i < src_shape.size(); ++i) {
+        if (i == axis) {
+            copy_shape[i] = dst_axis_len;
+        } else if (src_shape[i] != dst_shape[i]) {
+            throw std::runtime_error("Unexpected padded output non-axis shape for " + std::string(ggml_tensor->name) +
+                                     ": src=" + ov_shape_to_string(src_shape) +
+                                     ", dst=" + ov_shape_to_string(dst_shape) +
+                                     ", valid_len=" + std::to_string(valid_len) +
+                                     ", chunk_size=" + std::to_string(chunk_size) +
+                                     ", axis=" + std::to_string(axis));
+        }
+    }
+    (void) src_axis_len;
+    copy_ov_output_to_ggml_strided(output_tensor, ggml_tensor, copy_shape, false, axis, dst_axis_offset);
 }
 
 enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<ov_runtime_context> r_ctx) {
@@ -264,14 +607,34 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
             }
         }
 
+        struct OutputCopy {
+            ov::Tensor tensor;
+            ggml_tensor * dst;
+            bool copy_back = false;
+        };
+        std::vector<OutputCopy> output_copies;
+        output_copies.reserve(ov_output_names.size());
+
         for (size_t i = 0; i < ov_output_names.size(); i++) {
             auto * ggml_tensor = ggml_decoder->get_model_outputs().at(ov_output_names[i]);
-            auto output_tensor = create_ov_output_tensor(ggml_decoder, infer_request, i, ggml_tensor);
+            auto output_shape = infer_request->get_output_tensor(i).get_shape();
+            auto output_type = ggml_decoder->get_ov_type(ggml_tensor);
+            const bool direct_output = can_bind_ov_output_directly(output_shape, ggml_tensor);
+            auto output_tensor = direct_output ?
+                ov::Tensor(output_type, output_shape, ggml_tensor->data) :
+                ov::Tensor(output_type, output_shape);
             infer_request->set_output_tensor(i, output_tensor);
+            output_copies.push_back({output_tensor, ggml_tensor, !direct_output});
         }
 
         infer_request->infer();
         infer_end_time = ggml_time_us();
+
+        for (const auto & output_copy : output_copies) {
+            if (output_copy.copy_back) {
+                copy_ov_output_to_ggml(output_copy.tensor, output_copy.dst);
+            }
+        }
 
         if (getenv("GGML_OPENVINO_DEBUG_OUTPUT")) {
             for (size_t i = 0; i < ov_output_names.size(); i++) {
@@ -324,7 +687,7 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
     std::tie(m_params, c_params) = GgmlOvDecoder::compute_llm_params(cgraph, is_static);
 
     const auto * inp_pos = get_inp_pos_tensor(cgraph);
-    const auto is_prefill = get_is_prefill(inp_pos);
+    const auto is_prefill = c_params.input_len > 1;
     graph_key key(cgraph);
     bool cache_hit;
 
@@ -385,48 +748,34 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
         std::shared_ptr<ov::Model> model;
         auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph);
 
-        auto ggml_decoder_prefill = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights,
-                                                                    is_static, stateful, true, prefill_chunk_size);
-        auto ggml_decoder_decode = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static,
-                                                                   stateful, false, prefill_chunk_size);
+        ggml_decoder = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static, stateful,
+                                                       is_prefill, prefill_chunk_size);
         decoder_end_time = ggml_time_us();
 
-        auto input_model_prefill = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder_prefill);
-        auto input_model_decode = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder_decode);
-
-        auto model_prefill = ov::frontend::ggml::FrontEnd::convert(input_model_prefill);
-        ggml_decoder_prefill->clear_model_weights();
-        auto model_decode = ov::frontend::ggml::FrontEnd::convert(input_model_decode);
-        ggml_decoder_decode->clear_model_weights();
+        auto input_model = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder);
+        model = ov::frontend::ggml::FrontEnd::convert(input_model);
+        ggml_decoder->clear_model_weights();
         conversion_end_time = ggml_time_us();
 
         if (getenv("GGML_OPENVINO_DUMP_IR")) {
             char timestamped_filename[64];
             auto timestamp = (long long) ggml_time_us();
-            snprintf(timestamped_filename, sizeof(timestamped_filename), "model_prefill_%lld.xml", timestamp);
-            ov::serialize(model_prefill, timestamped_filename);
-            snprintf(timestamped_filename, sizeof(timestamped_filename), "model_decode_%lld.xml", timestamp);
-            ov::serialize(model_decode, timestamped_filename);
+            snprintf(timestamped_filename, sizeof(timestamped_filename), "model_%s_%lld.xml",
+                     is_prefill ? "prefill" : "decode", timestamp);
+            ov::serialize(model, timestamped_filename);
         }
 
-        ov::CompiledModel compiled_model_prefill;
-        ov::CompiledModel compiled_model_decode;
+        ov::CompiledModel compiled_model;
         auto remote_context = ggml_openvino_get_remote_context();
         if (remote_context.has_value()) {
-            compiled_model_prefill = core.compile_model(model_prefill, remote_context.value(), config);
-            compiled_model_decode = core.compile_model(model_decode, remote_context.value(), config);
+            compiled_model = core.compile_model(model, remote_context.value(), config);
         } else {
-            compiled_model_prefill = core.compile_model(model_prefill, device, config);
-            compiled_model_decode = core.compile_model(model_decode, device, config);
+            compiled_model = core.compile_model(model, device, config);
         }
 
-        auto infer_request_prefill = std::make_shared<ov::InferRequest>(compiled_model_prefill.create_infer_request());
-        auto infer_request_decode = std::make_shared<ov::InferRequest>(compiled_model_decode.create_infer_request());
+        infer_request = std::make_shared<ov::InferRequest>(compiled_model.create_infer_request());
         compile_end_time = ggml_time_us();
 
-        model = is_prefill ? model_prefill : model_decode;
-        ggml_decoder = is_prefill ? ggml_decoder_prefill : ggml_decoder_decode;
-        infer_request = is_prefill ? infer_request_prefill : infer_request_decode;
         entry->ptr = ggml_decoder;
 
         std::vector<std::string> ov_input_names;
@@ -440,8 +789,11 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
 
         {
             std::lock_guard<std::mutex> map_lock(r_ctx->ctx_mutex);
-            r_ctx->infer_request_cache_prefill[key] = infer_request_prefill;
-            r_ctx->infer_request_cache[key] = infer_request_decode;
+            if (is_prefill) {
+                r_ctx->infer_request_cache_prefill[key] = infer_request;
+            } else {
+                r_ctx->infer_request_cache[key] = infer_request;
+            }
             r_ctx->ov_input_names_cache[key] = std::move(ov_input_names);
             r_ctx->ov_output_names_cache[key] = std::move(ov_output_names);
         }
@@ -458,6 +810,14 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
     if (is_prefill) {
         auto inp_len = inp_pos->ne[0];
         for (int chunk_index = 0; chunk_index * prefill_chunk_size < inp_len; chunk_index++) {
+            struct StaticOutputCopy {
+                ov::Tensor tensor;
+                ggml_tensor * dst;
+                bool copy_back = false;
+            };
+            std::vector<StaticOutputCopy> output_copies;
+            output_copies.reserve(ov_output_names_local.size());
+
             for (size_t i = 0; i < ov_input_names_local.size(); i++) {
                 auto param_name = ov_input_names_local[i];
                 auto input_tensor = get_ov_input_tensor_static_prefill(ggml_decoder, param_name, chunk_index);
@@ -471,11 +831,31 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
 
             for (size_t i = 0; i < ov_output_names_local.size(); i++) {
                 auto * ggml_tensor = ggml_decoder->get_model_outputs().at(ov_output_names_local[i]);
-                auto output_tensor = create_ov_output_tensor(ggml_decoder, infer_request, i, ggml_tensor);
+                auto output_shape = infer_request->get_output_tensor(i).get_shape();
+                auto ggml_shape = GgmlOvDecoder::get_shape(ggml_tensor);
+                auto output_type = ggml_decoder->get_ov_type(ggml_tensor);
+                const auto output_ne = ov_shape_size(output_shape);
+                const auto ggml_ne = static_cast<size_t>(ggml_nelements(ggml_tensor));
+                (void) ggml_shape;
+                (void) output_ne;
+                (void) ggml_ne;
+                const bool skip_output_copy = is_view_like_output(ggml_tensor) && is_static_cache_view_output(ggml_tensor);
+                const bool direct_output = can_bind_ov_output_directly(output_shape, ggml_tensor);
+                auto output_tensor = direct_output ?
+                    ov::Tensor(output_type, output_shape, ggml_tensor->data) :
+                    ov::Tensor(output_type, output_shape);
                 infer_request->set_output_tensor(i, output_tensor);
+                output_copies.push_back({output_tensor, ggml_tensor, !direct_output && !skip_output_copy});
             }
 
             infer_request->infer();
+
+            for (const auto & output_copy : output_copies) {
+                if (output_copy.copy_back) {
+                    copy_static_prefill_output_to_ggml(
+                        output_copy.tensor, output_copy.dst, inp_len, prefill_chunk_size, chunk_index);
+                }
+            }
 
             if (getenv("GGML_OPENVINO_DEBUG_OUTPUT")) {
                 for (size_t i = 0; i < ov_output_names_local.size(); i++) {
@@ -497,14 +877,35 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph, std::shared_ptr<o
             }
         }
 
+        struct StaticDecodeOutputCopy {
+            ov::Tensor tensor;
+            ggml_tensor * dst;
+            bool copy_back = false;
+        };
+        std::vector<StaticDecodeOutputCopy> output_copies;
+        output_copies.reserve(ov_output_names_local.size());
+
         for (size_t i = 0; i < ov_output_names_local.size(); i++) {
             auto * ggml_tensor = ggml_decoder->get_model_outputs().at(ov_output_names_local[i]);
-            auto output_tensor = create_ov_output_tensor(ggml_decoder, infer_request, i, ggml_tensor);
+            auto output_shape = infer_request->get_output_tensor(i).get_shape();
+            auto output_type = ggml_decoder->get_ov_type(ggml_tensor);
+            const bool skip_output_copy = is_view_like_output(ggml_tensor) && is_static_cache_view_output(ggml_tensor);
+            const bool direct_output = can_bind_ov_output_directly(output_shape, ggml_tensor);
+            auto output_tensor = direct_output ?
+                ov::Tensor(output_type, output_shape, ggml_tensor->data) :
+                ov::Tensor(output_type, output_shape);
             infer_request->set_output_tensor(i, output_tensor);
+            output_copies.push_back({output_tensor, ggml_tensor, !direct_output && !skip_output_copy});
         }
 
         infer_request->infer();
         infer_end_time = ggml_time_us();
+
+        for (const auto & output_copy : output_copies) {
+            if (output_copy.copy_back) {
+                copy_ov_output_to_ggml(output_copy.tensor, output_copy.dst);
+            }
+        }
 
         if (getenv("GGML_OPENVINO_DEBUG_OUTPUT")) {
             for (size_t i = 0; i < ov_output_names_local.size(); i++) {
@@ -579,13 +980,32 @@ enum ggml_status naive_compute(ggml_cgraph * cgraph,
     }
 
     auto ov_results = model->get_results();
+    struct NaiveOutputCopy {
+        ov::Tensor tensor;
+        ggml_tensor * dst;
+        bool copy_back = false;
+    };
+    std::vector<NaiveOutputCopy> output_copies;
+    output_copies.reserve(ov_results.size());
+
     for (size_t i = 0; i < ov_results.size(); i++) {
         auto * ggml_tensor = decoder->get_model_outputs().at(ov_results[i]->get_friendly_name());
-        auto output_tensor = create_ov_output_tensor(decoder, infer_request, i, ggml_tensor);
+        auto output_shape = infer_request->get_output_tensor(i).get_shape();
+        auto output_type = decoder->get_ov_type(ggml_tensor);
+        const bool direct_output = can_bind_ov_output_directly(output_shape, ggml_tensor);
+        auto output_tensor = direct_output ?
+            ov::Tensor(output_type, output_shape, ggml_tensor->data) :
+            ov::Tensor(output_type, output_shape);
         infer_request->set_output_tensor(i, output_tensor);
+        output_copies.push_back({output_tensor, ggml_tensor, !direct_output});
     }
 
     infer_request->infer();
+    for (const auto & output_copy : output_copies) {
+        if (output_copy.copy_back) {
+            copy_ov_output_to_ggml(output_copy.tensor, output_copy.dst);
+        }
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -596,22 +1016,15 @@ ov::Tensor convert_ggml_input_to_ov(std::shared_ptr<GgmlOvDecoder> ggml_decoder,
     if (ggml_tensor->extra != nullptr) {
         // GGML_LOG_DEBUG("Using ggml_tensor->extra as ov::Tensor for input: %s\n", name.c_str());
         auto * extra_base = static_cast<ggml_openvino_extra_base *>(ggml_tensor->extra);
-        if (extra_base->type != ggml_openvino_extra_base::Type::TENSOR) {
-            throw std::runtime_error("ggml tensor extra is not of type TENSOR for input: " + name);
+        if (extra_base->type == ggml_openvino_extra_base::Type::TENSOR) {
+            auto * tensor_extra = static_cast<ggml_openvino_tensor_extra *>(extra_base);
+            return *tensor_extra->tensor;
         }
-        auto * tensor_extra = static_cast<ggml_openvino_tensor_extra *>(extra_base);
-        return *tensor_extra->tensor;
     }
 
     // GGML_LOG_DEBUG("Converting ggml tensor to ov::Tensor for input: %s\n", name.c_str());
     auto * input_data = ggml_tensor->data;
-    ov::Shape input_shape;
-    if (ggml_tensor->op == GGML_OP_VIEW) {
-        // This case is added to make test-backend-ops work
-        input_shape = ggml_decoder->get_shape(ggml_tensor->view_src);
-    } else {
-        input_shape = ggml_decoder->get_shape(ggml_tensor);
-    }
+    ov::Shape input_shape = ggml_decoder->get_shape(ggml_tensor);
     auto input_tensor = ov::Tensor(ggml_decoder->get_ov_type(ggml_tensor), input_shape, input_data);
     return input_tensor;
 }
@@ -635,13 +1048,17 @@ ov::Tensor get_ov_input_tensor_static_decode(std::shared_ptr<GgmlOvDecoder> ggml
 
     if (GgmlOvDecoder::is_inp_tok(ggml_tensor, op) || GgmlOvDecoder::is_inp_pos(ggml_tensor, op) ||
         GgmlOvDecoder::is_kv_idx(ggml_tensor, op)) {
-        assert(ggml_tensor->ne[0] == 1);
-        ov::Shape input_shape = {1, 1, 1, 1};
+        size_t lane_width = 1;
+        if (GgmlOvDecoder::is_kv_idx(ggml_tensor, op) && ggml_decoder->get_input_len() > 0 &&
+            ggml_tensor->ne[0] % ggml_decoder->get_input_len() == 0) {
+            lane_width = ggml_tensor->ne[0] / ggml_decoder->get_input_len();
+        }
+        ov::Shape input_shape = {1, 1, 1, lane_width};
         ov::Tensor input_tensor(ggml_decoder->get_ov_type(ggml_tensor), input_shape);
         if (ggml_tensor->type == GGML_TYPE_I32) {
-            *input_tensor.data<int32_t>() = *((int32_t *) ggml_tensor->data);
+            std::memcpy(input_tensor.data(), ggml_tensor->data, lane_width * sizeof(int32_t));
         } else if (ggml_tensor->type == GGML_TYPE_I64) {
-            *input_tensor.data<int64_t>() = *((int64_t *) ggml_tensor->data);
+            std::memcpy(input_tensor.data(), ggml_tensor->data, lane_width * sizeof(int64_t));
         } else {
             throw std::runtime_error("Unexpected tensor type for " + param_name);
         }
@@ -680,29 +1097,35 @@ ov::Tensor get_ov_input_tensor_static_prefill(std::shared_ptr<GgmlOvDecoder> ggm
     const size_t input_len = ggml_decoder->get_input_len();
     const size_t chunk_size = ggml_decoder->m_prefill_chunk_size;
     const size_t chunk_valid_size = std::min(chunk_size, input_len - chunk_index * chunk_size);
-    const size_t chunk_pad_size = chunk_size - chunk_valid_size;
 
     if (GgmlOvDecoder::is_inp_tok(ggml_tensor, op) || GgmlOvDecoder::is_inp_pos(ggml_tensor, op) ||
         GgmlOvDecoder::is_kv_idx(ggml_tensor, op)) {
-        ov::Shape input_shape = {1, 1, 1, chunk_size};
+        size_t lane_width = 1;
+        if (GgmlOvDecoder::is_kv_idx(ggml_tensor, op) && input_len > 0 && ggml_tensor->ne[0] % input_len == 0) {
+            lane_width = ggml_tensor->ne[0] / input_len;
+        }
+        const size_t input_chunk_size = chunk_size * lane_width;
+        const size_t input_chunk_valid_size = chunk_valid_size * lane_width;
+        const size_t input_chunk_pad_size = input_chunk_size - input_chunk_valid_size;
+        ov::Shape input_shape = {1, 1, 1, input_chunk_size};
         ov::Tensor input_tensor(ggml_decoder->get_ov_type(ggml_tensor), input_shape);
         // copy the chunk_index-th chunk from ggml_tensor
         size_t element_size = ggml_type_size(ggml_tensor->type);
-        void * input_data = (char *) ggml_tensor->data + chunk_index * chunk_size * element_size;
-        std::memcpy(input_tensor.data(), input_data, chunk_valid_size * element_size);
+        void * input_data = (char *) ggml_tensor->data + chunk_index * input_chunk_size * element_size;
+        std::memcpy(input_tensor.data(), input_data, input_chunk_valid_size * element_size);
         // pad the rest with last_value + 1, so that kv's of padded positions are inserted
         // to the next row after the valids row in the kvcache
-        if (chunk_pad_size > 0) {
+        if (input_chunk_pad_size > 0) {
             if (ggml_tensor->type == GGML_TYPE_I32) {
                 int32_t last_value =
-                    *((int32_t *) ggml_tensor->data + (chunk_index * chunk_size + chunk_valid_size - 1));
+                    *((int32_t *) ggml_tensor->data + (chunk_index * input_chunk_size + input_chunk_valid_size - 1));
                 int32_t * output_data = input_tensor.data<int32_t>();
-                std::fill(output_data + chunk_valid_size, output_data + chunk_size, last_value + 1);
+                std::fill(output_data + input_chunk_valid_size, output_data + input_chunk_size, last_value + 1);
             } else if (ggml_tensor->type == GGML_TYPE_I64) {
                 int64_t last_value =
-                    *((int64_t *) ggml_tensor->data + (chunk_index * chunk_size + chunk_valid_size - 1));
+                    *((int64_t *) ggml_tensor->data + (chunk_index * input_chunk_size + input_chunk_valid_size - 1));
                 int64_t * output_data = input_tensor.data<int64_t>();
-                std::fill(output_data + chunk_valid_size, output_data + chunk_size, last_value + 1);
+                std::fill(output_data + input_chunk_valid_size, output_data + input_chunk_size, last_value + 1);
             } else {
                 throw std::runtime_error("Unexpected tensor type for " + param_name);
             }
@@ -740,7 +1163,40 @@ ov::Tensor get_ov_input_tensor_static_prefill(std::shared_ptr<GgmlOvDecoder> ggm
         return input_tensor;
     }
 
-    return get_ov_input_tensor(ggml_decoder, param_name);
+    auto input_tensor = get_ov_input_tensor(ggml_decoder, param_name);
+    auto input_shape = input_tensor.get_shape();
+    auto padded_shape = input_shape;
+    auto axis_it = std::find(padded_shape.begin(), padded_shape.end(), input_len);
+    if (axis_it == padded_shape.end()) {
+        return input_tensor;
+    }
+
+    const size_t axis = std::distance(padded_shape.begin(), axis_it);
+    padded_shape[axis] = chunk_size;
+    ov::Tensor padded_tensor(input_tensor.get_element_type(), padded_shape);
+    std::memset(padded_tensor.data(), 0, padded_tensor.get_byte_size());
+
+    size_t outer_size = 1;
+    for (size_t i = 0; i < axis; ++i) {
+        outer_size *= input_shape[i];
+    }
+    size_t inner_size = 1;
+    for (size_t i = axis + 1; i < input_shape.size(); ++i) {
+        inner_size *= input_shape[i];
+    }
+
+    const size_t element_size = input_tensor.get_byte_size() / input_tensor.get_size();
+    const size_t valid_len = std::min(chunk_size, input_len - chunk_index * chunk_size);
+    const size_t src_axis_offset = chunk_index * chunk_size;
+    auto * src = static_cast<const uint8_t *>(input_tensor.data());
+    auto * dst = static_cast<uint8_t *>(padded_tensor.data());
+    for (size_t outer = 0; outer < outer_size; ++outer) {
+        const size_t src_offset = (outer * input_len + src_axis_offset) * inner_size * element_size;
+        const size_t dst_offset = outer * chunk_size * inner_size * element_size;
+        std::memcpy(dst + dst_offset, src + src_offset, valid_len * inner_size * element_size);
+    }
+
+    return padded_tensor;
 }
 
 size_t checksum(const void * data, size_t size) {

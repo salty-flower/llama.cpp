@@ -47,7 +47,6 @@ OutputVector translate_reshape(const NodeContext & context) {
             std::vector<int64_t>{(int64_t) output_shape[0], (int64_t) output_shape[1], -1, (int64_t) output_shape[3]});
 
     } else if (op_case == 3) {
-        throw std::runtime_error("might be outdated RESHAPE case");
         new_shape_node = ov::op::v0::Constant::create(
             ov::element::i64, {4}, std::vector<int64_t>{(int64_t) output_shape[0], (int64_t) output_shape[1], -1, 1});
 
