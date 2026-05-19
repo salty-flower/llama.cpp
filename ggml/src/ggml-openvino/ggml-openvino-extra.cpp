@@ -6,12 +6,39 @@
 #include <cstring>
 #include <openvino/runtime/intel_gpu/ocl/ocl.hpp>
 #include <openvino/runtime/intel_npu/level_zero/level_zero.hpp>
+#include <openvino/runtime/intel_npu/properties.hpp>
 #include <openvino/runtime/properties.hpp>
 #include <optional>
 
 ov::Core & ov_singleton_core() {
     static ov::Core core;
     return core;
+}
+
+static bool ggml_openvino_env_is_enabled(const char * name, bool default_value) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 && strcasecmp(value, "no") != 0 &&
+           strcasecmp(value, "off") != 0;
+}
+
+static std::optional<ov::intel_npu::CompilerType> ggml_openvino_get_npu_compiler_type(const char * value) {
+    if (value == nullptr || value[0] == '\0') {
+        return std::nullopt;
+    }
+    if (strcasecmp(value, "plugin") == 0) {
+        return ov::intel_npu::CompilerType::PLUGIN;
+    }
+    if (strcasecmp(value, "driver") == 0) {
+        return ov::intel_npu::CompilerType::DRIVER;
+    }
+    if (strcasecmp(value, "prefer_plugin") == 0 || strcasecmp(value, "prefer-plugin") == 0) {
+        return ov::intel_npu::CompilerType::PREFER_PLUGIN;
+    }
+    GGML_LOG_WARN("GGML OpenVINO Backend: ignoring unknown GGML_OPENVINO_NPU_COMPILER_TYPE=%s\n", value);
+    return std::nullopt;
 }
 
 // =====================================================
@@ -32,18 +59,25 @@ void ggml_openvino_device_config::init() {
 
     auto * cache_dir = getenv("GGML_OPENVINO_CACHE_DIR");
     if (device_name == "NPU") {
-        compile_config = {
-            {"NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES"   },
-            {"NPU_USE_NPUW",                      "YES"   },
-            {"NPUW_DEVICES",                      "NPU"   },
-            {"NPUW_FOLD",                         "YES"   },
-            {"NPUW_WEIGHTS_BANK",                 "shared"},
-            {"NPUW_FUNCALL_FOR_ALL",              "YES"   },
-            {"NPUW_FUNCALL_ASYNC",                "YES"   },
-            {"NPUW_DQ",                           "YES"   },
-            {"NPUW_DQ_FULL",                      "NO"    },
-        };
-        if (cache_dir && strlen(cache_dir) > 0) {
+        if (ggml_openvino_env_is_enabled("GGML_OPENVINO_NPU_DYNAMIC_QUANTIZATION", true)) {
+            compile_config.insert(ov::intel_npu::compiler_dynamic_quantization(true));
+        }
+        if (auto compiler_type = ggml_openvino_get_npu_compiler_type(getenv("GGML_OPENVINO_NPU_COMPILER_TYPE"))) {
+            compile_config.insert(ov::intel_npu::compiler_type(*compiler_type));
+        }
+        if (ggml_openvino_env_is_enabled("GGML_OPENVINO_NPU_USE_NPUW", true)) {
+            compile_config.insert({
+                {"NPU_USE_NPUW",         "YES"   },
+                {"NPUW_DEVICES",         "NPU"   },
+                {"NPUW_FOLD",            "YES"   },
+                {"NPUW_WEIGHTS_BANK",    "shared"},
+                {"NPUW_FUNCALL_FOR_ALL", "YES"   },
+                {"NPUW_FUNCALL_ASYNC",   "YES"   },
+                {"NPUW_DQ",              "YES"   },
+                {"NPUW_DQ_FULL",         "NO"    },
+            });
+        }
+        if (cache_dir && strlen(cache_dir) > 0 && ggml_openvino_env_is_enabled("GGML_OPENVINO_NPU_USE_NPUW", true)) {
             compile_config["NPUW_CACHE_DIR"] = cache_dir;
             compile_config.insert(ov::cache_mode(ov::CacheMode::OPTIMIZE_SIZE));
         }
