@@ -121,7 +121,8 @@ OutputVector translate_rope(const NodeContext & context) {
         res = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{first_half_node, second_half_node}, -1);
     } else if (mode == TYPE_IMROPE) {
         int64_t n_dims = data_node->get_shape()[3];
-        auto cos_sin_shape = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{4}, std::vector<int64_t>{1,-1,1,(n_dims >> 1)});
+        auto cos_sin_shape = std::make_shared<ov::op::v0::Constant>(
+            ov::element::i64, ov::Shape{4}, std::vector<int64_t>{1, 1, -1, (n_dims >> 1)});
         auto cos_reshaped = std::make_shared<ov::op::v1::Reshape>(cos_theta_node, cos_sin_shape, true);
         auto sin_reshaped = std::make_shared<ov::op::v1::Reshape>(sin_theta_node, cos_sin_shape, true);
 

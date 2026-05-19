@@ -2,6 +2,7 @@
 
 #include "ggml-openvino/openvino/node_context.h"
 #include "ggml-openvino/openvino/utils.h"
+#include "ggml.h"
 #include "input_model.h"
 #include "pass/mark_decompression_convert_constant_folding.h"
 #include "pass/squeeze_matmul.h"
@@ -130,7 +131,7 @@ void add_rope_sin_cos(TensorMap & tensor_map, GgmlDecoder & ggml_model_decoder) 
         rope_freqs_weight = tensor_map.at("rope_freqs.weight").get_node_shared_ptr();
     }
 
-    auto sin_cos = make_sin_cos(rope_params, inp_pos, rope_freqs_weight);
+    auto sin_cos = make_sin_cos(rope_params, inp_pos, rope_freqs_weight, rope_params[2] == GGML_ROPE_TYPE_IMROPE);
     auto sin_theta = sin_cos.first;
     auto cos_theta = sin_cos.second;
 
