@@ -1,7 +1,11 @@
 find_package(OpenVINO REQUIRED)
 find_package(OpenCL REQUIRED)
 
-include("${OpenVINO_DIR}/../3rdparty/tbb/lib/cmake/TBB/TBBConfig.cmake")
+if (EXISTS "${OpenVINO_DIR}/../3rdparty/tbb/lib/cmake/TBB/TBBConfig.cmake")
+    include("${OpenVINO_DIR}/../3rdparty/tbb/lib/cmake/TBB/TBBConfig.cmake")
+else()
+    find_package(TBB REQUIRED COMPONENTS tbb)
+endif()
 
 file(GLOB_RECURSE GGML_HEADERS_OPENVINO "*.h" "*.hpp")
 file(GLOB_RECURSE GGML_SOURCES_OPENVINO "*.cpp")
