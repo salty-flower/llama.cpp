@@ -2762,6 +2762,7 @@ private:
                             n_swa > 0);
 
                     bool has_mtmd = false;
+                    bool mtmd_failed = false;
 
                     // check if we should process the image
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
@@ -2772,7 +2773,8 @@ private:
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                             slot.release();
-                            continue;
+                            mtmd_failed = true;
+                            break;
                         }
 
                         if (ctx_dft) {
@@ -2794,6 +2796,9 @@ private:
                         }
 
                         has_mtmd = true;
+                    }
+                    if (mtmd_failed) {
+                        continue;
                     }
 
                     // add prompt tokens for processing in the current batch
